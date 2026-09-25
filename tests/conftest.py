@@ -1,5 +1,6 @@
 import os
 import subprocess
+import sys
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 
 import pytest
@@ -16,7 +17,7 @@ def database() -> Iterator[None]:
     with PostgresContainer("postgres:16-alpine", driver="asyncpg") as pg:
         os.environ["DATABASE_URL"] = pg.get_connection_url()
         os.environ["SECRET_ENCRYPTION_KEY"] = Fernet.generate_key().decode()
-        subprocess.run(["alembic", "upgrade", "head"], check=True)  # noqa: S607
+        subprocess.run([sys.executable, "-m", "alembic", "upgrade", "head"], check=True)
         yield
 
 
