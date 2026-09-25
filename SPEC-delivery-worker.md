@@ -10,9 +10,9 @@ With concurrent workers, each due delivery is attempted by exactly one worker at
 
 **Out of scope:** signing and the SSRF guard (module `security`); the circuit breaker, `/v1/deliveries` API, replay and metrics (module `operations`); graceful shutdown (the lease already covers a killed worker).
 
-## Assumptions (correct any of these)
+## Decisions (approved 2026-09-25)
 1. **The lease is `next_attempt_at`, so there is no `in_flight` state.** Claiming pushes `next_attempt_at` 60s ahead and increments `attempt_count`. A worker that dies simply lets the lease lapse, and the row becomes due again: no reaper is needed and the existing partial index still covers the claim query. `locked_until` becomes redundant and is dropped.
-2. **Seven attempts total:** 1 initial attempt + 6 retries. Retry ceilings are `[10s, 1m, 5m, 30m, 2h, 6h]`. Delay = `uniform(0.5, 1.0) × ceiling`, which is equal jitter. Worst case is about 8.8h to dead-letter.
+2. **Seven attempts total:** 1 initial attempt + 6 retries. Retry ceilings are `[10s, 1m, 5m, 30m, 2h, 6h]`. Delay = `uniform(0, ceiling)`, which is full jitter, per the build spec. On average it takes about 4.4h to dead-letter, and at most about 8.8h. A retry can fire almost immediately; that is accepted, since spreading retries out matters more than a minimum gap.
 3. **Success means 2xx only.** 3xx (never followed), 4xx, 5xx, timeouts and connection errors all go to retry. No special handling for 410 yet.
 4. **Timeouts:** connect 3s, read 10s, 15s total per attempt. At most 4 KB of the response body is read and stored; the rest is never downloaded.
 5. **Endpoint state:**
@@ -59,7 +59,7 @@ With concurrent workers, each due delivery is attempted by exactly one worker at
 ## Success criteria
 Integration tests over real Postgres, with outbound HTTP via `httpx.MockTransport`:
 - [ ] 200 → `succeeded`, with one attempt row holding status, duration and the sent headers
-- [ ] 500 → `pending`, `attempt_count = 1`, and `next_attempt_at` within [now+5s, now+10s]
+- [ ] 500 → `pending`, `attempt_count = 1`, and `next_attempt_at` within [now, now+10s]
 - [ ] a timeout gives an attempt row with `error` set and the delivery still `pending`
 - [ ] 302 counts as a failure, and exactly one request was made (not followed)
 - [ ] a 7th consecutive failure → `dead_lettered`
@@ -76,4 +76,4 @@ Integration tests over real Postgres, with outbound HTTP via `httpx.MockTranspor
 - [ ] The README gains "Claiming work" and "Retry, backoff and jitter" sections, and the engineering log is updated.
 
 ## Open questions
-See the assumptions above. Items 1, 2 and 5 change the schema or behaviour, so they need a decision before any code is written.
+None. Items 1, 2 and 5 were decided on 2026-09-25: lease via `next_attempt_at`, full jitter, disabled endpoints wait and deleted endpoints dead-letter.
