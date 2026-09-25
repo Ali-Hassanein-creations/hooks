@@ -1,0 +1,24 @@
+﻿services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: webhooks
+      POSTGRES_PASSWORD: webhooks
+      POSTGRES_DB: webhooks
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "webhooks"]
+      interval: 2s
+      retries: 15
+
+  api:
+    build: .
+    environment:
+      DATABASE_URL: postgresql+asyncpg://webhooks:webhooks@postgres:5432/webhooks
+      # Dev-only key. In any real deployment this comes from a secret store.
+      SECRET_ENCRYPTION_KEY: 53e3t6jx9F6UErqnZ3HYdnEJjPMKZ2wiQ-Wwmt1nBQM=
+    # ponytail: migrate-on-boot is fine for one replica; make it a one-shot job before scaling out
+    command: sh -c "alembic upgrade head && uvicorn webhooks.main:app --host 0.0.0.0 --port 8000"
+    ports: ["8000:8000"]
+    depends_on:
+      postgres:
+        condition: service_healthy
