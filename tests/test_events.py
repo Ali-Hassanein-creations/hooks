@@ -86,3 +86,15 @@ async def test_same_key_different_tenants_are_independent(
     rb = await client.post("/v1/events", json=EVENT, headers={**b, "Idempotency-Key": "k"})
     assert (ra.status_code, rb.status_code) == (202, 202)
     assert ra.json()["id"] != rb.json()["id"]
+
+
+async def test_reused_key_with_different_body_is_422(
+    client: AsyncClient, make_tenant: MakeTenant
+) -> None:
+    h = {**await make_tenant(), "Idempotency-Key": "k"}
+    assert (await client.post("/v1/events", json=EVENT, headers=h)).status_code == 202
+    other = {**EVENT, "payload": {"order_id": 43}}
+    assert (await client.post("/v1/events", json=other, headers=h)).status_code == 422
+    # Same body with keys in a different order is still the same request.
+    reordered = {"payload": EVENT["payload"], "event_type": EVENT["event_type"]}
+    assert (await client.post("/v1/events", json=reordered, headers=h)).status_code == 200

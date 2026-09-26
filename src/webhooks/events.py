@@ -1,3 +1,5 @@
+import hashlib
+import json
 import uuid
 from datetime import datetime
 from typing import Annotated, Any
@@ -56,18 +58,28 @@ async def ingest(
     await session.execute(
         select(func.pg_advisory_xact_lock(func.hashtextextended(f"{tenant}:{idempotency_key}", 0)))
     )
+    # Canonical JSON so key order in the client's body doesn't change the hash.
+    request_hash = hashlib.sha256(
+        json.dumps(body.model_dump(), sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
     existing = await session.scalar(
         select(Event).where(Event.tenant_id == tenant, Event.idempotency_key == idempotency_key)
     )
     if existing is not None:
-        # ponytail: a reused key with a different body still returns the original;
-        # store a request hash and 422 on mismatch if clients need that caught
+        if existing.request_hash not in (None, request_hash):
+            await session.rollback()
+            raise HTTPException(422, "Idempotency-Key was already used with a different body")
         out = EventOut.model_validate(existing)
         await session.rollback()  # releases the advisory lock
         response.status_code = 200
         return out
 
-    event = Event(tenant_id=tenant, idempotency_key=idempotency_key, **body.model_dump())
+    event = Event(
+        tenant_id=tenant,
+        idempotency_key=idempotency_key,
+        request_hash=request_hash,
+        **body.model_dump(),
+    )
     session.add(event)
     await session.flush()
     await session.execute(

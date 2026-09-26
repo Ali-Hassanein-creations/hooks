@@ -2,10 +2,11 @@ import hashlib
 import hmac
 import secrets
 import uuid
+from datetime import timedelta
 from typing import Annotated
 
 from fastapi import Depends, HTTPException, Request
-from sqlalchemy import func, select, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from webhooks.db import get_session
@@ -38,8 +39,18 @@ async def current_tenant(request: Request, session: DbSession) -> uuid.UUID:
     )
     if row is None or not hmac.compare_digest(row.key_hash, _hash(key)):
         raise unauthorized
-    # ponytail: write per request; throttle to once a minute if this becomes a hot row
-    await session.execute(update(ApiKey).where(ApiKey.id == row.id).values(last_used_at=func.now()))
+    # At most one write per key per minute, so a busy key's row doesn't become a hot spot.
+    await session.execute(
+        update(ApiKey)
+        .where(
+            ApiKey.id == row.id,
+            or_(
+                ApiKey.last_used_at.is_(None),
+                ApiKey.last_used_at < func.now() - timedelta(minutes=1),
+            ),
+        )
+        .values(last_used_at=func.now())
+    )
     await session.commit()
     return row.tenant_id
 
