@@ -1,7 +1,7 @@
 import os
 from collections.abc import AsyncIterator
 
-from cryptography.fernet import Fernet
+from cryptography.fernet import Fernet, MultiFernet
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 DATABASE_URL = os.environ["DATABASE_URL"]  # postgresql+asyncpg://...
@@ -9,8 +9,9 @@ DATABASE_URL = os.environ["DATABASE_URL"]  # postgresql+asyncpg://...
 engine = create_async_engine(DATABASE_URL, pool_pre_ping=True)
 Session = async_sessionmaker(engine, expire_on_commit=False)
 
-# ponytail: single key; switch to MultiFernet when the encryption key itself needs rotating
-_fernet = Fernet(os.environ["SECRET_ENCRYPTION_KEY"])
+# Comma-separated keys: the first encrypts, any of them decrypts. To rotate, put the new
+# key first and keep the old one until existing secrets have been re-encrypted.
+_fernet = MultiFernet([Fernet(k) for k in os.environ["SECRET_ENCRYPTION_KEY"].split(",")])
 
 
 def encrypt(plain: str) -> bytes:

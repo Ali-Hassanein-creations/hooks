@@ -75,6 +75,8 @@ class Event(Base):
     id: Mapped[uuid.UUID] = _pk()
     tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tenants.id"))
     idempotency_key: Mapped[str] = mapped_column(String(255))
+    # SHA-256 of the request body; NULL for events stored before migration 0003.
+    request_hash: Mapped[str | None] = mapped_column(String(64))
     event_type: Mapped[str] = mapped_column(String(200))
     payload: Mapped[dict[str, Any]] = mapped_column(JSONB)
     created_at: Mapped[datetime] = _now()
