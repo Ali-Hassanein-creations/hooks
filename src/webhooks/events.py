@@ -1,17 +1,33 @@
 import hashlib
 import json
+import os
 import uuid
 from datetime import datetime
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Header, HTTPException, Response
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import any_, func, insert, literal, select
+from sqlalchemy import any_, func, insert, literal, select, text
 
 from webhooks.auth import DbSession, TenantId
 from webhooks.models import Delivery, Endpoint, Event
 
 router = APIRouter(prefix="/v1/events", tags=["events"])
+
+RATE_LIMIT_PER_MINUTE = int(os.environ.get("RATE_LIMIT_PER_MINUTE", "600"))
+
+# One row per tenant holding the current minute and its count; the upsert is atomic, so it
+# holds across any number of API replicas without Redis.
+# ponytail: fixed window lets a tenant burst up to 2x the limit across a minute boundary;
+# switch to a token bucket if that matters
+_COUNT_REQUEST = text("""
+INSERT INTO rate_limits AS r (tenant_id, window_start, count)
+VALUES (:tenant, date_trunc('minute', now()), 1)
+ON CONFLICT (tenant_id) DO UPDATE SET
+    count = CASE WHEN r.window_start = EXCLUDED.window_start THEN r.count + 1 ELSE 1 END,
+    window_start = EXCLUDED.window_start
+RETURNING count AS n, 60 - floor(extract(second FROM now()))::int AS retry_after
+""")
 
 
 class EventIn(BaseModel):
@@ -53,6 +69,14 @@ async def ingest(
     This is the transactional outbox: workers poll `deliveries` directly, so there is no
     separate queue push that could be lost (or run ahead) if we crash mid-request.
     """
+    # Counted and committed on its own, so it sticks even when the ingest below rolls back.
+    limit = (await session.execute(_COUNT_REQUEST, {"tenant": tenant})).one()
+    await session.commit()
+    if limit.n > RATE_LIMIT_PER_MINUTE:
+        raise HTTPException(
+            429, "rate limit exceeded", headers={"Retry-After": str(limit.retry_after)}
+        )
+
     # Serialises concurrent requests for the same key: a client retrying while its first
     # request is still in flight waits here, then sees the committed event below.
     await session.execute(

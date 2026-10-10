@@ -2,6 +2,7 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+import pytest
 from httpx import AsyncClient
 from sqlalchemy import func, select
 
@@ -98,3 +99,21 @@ async def test_reused_key_with_different_body_is_422(
     # Same body with keys in a different order is still the same request.
     reordered = {"payload": EVENT["payload"], "event_type": EVENT["event_type"]}
     assert (await client.post("/v1/events", json=reordered, headers=h)).status_code == 200
+
+
+async def test_ingest_is_rate_limited_per_tenant(
+    client: AsyncClient, make_tenant: MakeTenant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from webhooks import events
+
+    monkeypatch.setattr(events, "RATE_LIMIT_PER_MINUTE", 3)
+    a, b = await make_tenant(), await make_tenant()
+    codes = [
+        (await client.post("/v1/events", json=EVENT, headers={**a, "Idempotency-Key": f"k{i}"}))
+        for i in range(4)
+    ]
+    assert [r.status_code for r in codes] == [202, 202, 202, 429]
+    assert 1 <= int(codes[-1].headers["Retry-After"]) <= 60
+    # Another tenant has its own budget.
+    r = await client.post("/v1/events", json=EVENT, headers={**b, "Idempotency-Key": "k"})
+    assert r.status_code == 202
