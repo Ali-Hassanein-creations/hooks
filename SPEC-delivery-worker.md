@@ -14,7 +14,7 @@ With concurrent workers, each due delivery is attempted by exactly one worker at
 
 ## Decisions (approved 2026-09-25)
 1. **The lease is `next_attempt_at`, so there is no `in_flight` state.** Claiming pushes `next_attempt_at` 60s ahead and increments `attempt_count`. A worker that dies simply lets the lease lapse, and the row becomes due again: no reaper is needed and the existing partial index still covers the claim query. `locked_until` becomes redundant and is dropped.
-2. **Seven attempts total:** 1 initial attempt + 6 retries. Retry ceilings are `[10s, 1m, 5m, 30m, 2h, 6h]`. Delay = `uniform(0, ceiling)`, which is full jitter, per the build spec. On average it takes about 4.4h to dead-letter, and at most about 8.8h. A retry can fire almost immediately; that is accepted, since spreading retries out matters more than a minimum gap.
+2. **Seven attempts total:** 1 initial attempt + 6 retries. Retry ceilings are `[10s, 1m, 5m, 30m, 2h, 6h]`. Delay = `uniform(0, ceiling)`, which is full jitter, per the build spec. On average it takes about 4.3h to dead-letter, and at most about 8.6h. A retry can fire almost immediately; that is accepted, since spreading retries out matters more than a minimum gap.
 3. **Success means 2xx only.** 3xx (never followed), 4xx, 5xx, timeouts and connection errors all go to retry. No special handling for 410 yet.
 4. **Timeouts:** connect 3s, read 10s, 15s total per attempt. At most 4 KB of the response body is read and stored; the rest is never downloaded.
 5. **Endpoint state:**
