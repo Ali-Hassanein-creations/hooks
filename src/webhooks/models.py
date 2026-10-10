@@ -62,6 +62,9 @@ class Endpoint(Base):
     url: Mapped[str] = mapped_column(Text)
     description: Mapped[str | None] = mapped_column(Text)
     secret_encrypted: Mapped[bytes] = mapped_column(LargeBinary)
+    # During a rotation the old secret keeps signing too, until it expires.
+    previous_secret_encrypted: Mapped[bytes | None] = mapped_column(LargeBinary)
+    previous_secret_expires_at: Mapped[datetime | None]
     event_types: Mapped[list[str]] = mapped_column(ARRAY(Text))
     status: Mapped[str] = mapped_column(String(16), server_default="enabled")
     created_at: Mapped[datetime] = _now()
@@ -100,6 +103,21 @@ class Delivery(Base):
     endpoint_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("endpoints.id"), index=True)
     status: Mapped[str] = mapped_column(String(16), server_default="pending")
     attempt_count: Mapped[int] = mapped_column(Integer, server_default="0")
+    # Doubles as the worker's lease: claiming a row pushes it forward (see worker.CLAIM).
     next_attempt_at: Mapped[datetime] = _now()
-    locked_until: Mapped[datetime | None]
     created_at: Mapped[datetime] = _now()
+
+
+class DeliveryAttempt(Base):
+    __tablename__ = "delivery_attempts"
+    __table_args__ = (UniqueConstraint("delivery_id", "attempt_number"),)
+    id: Mapped[uuid.UUID] = _pk()
+    tenant_id: Mapped[uuid.UUID] = _tenant()
+    delivery_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("deliveries.id"))
+    attempt_number: Mapped[int]
+    request_headers: Mapped[dict[str, str]] = mapped_column(JSONB)
+    response_status: Mapped[int | None]
+    response_body: Mapped[str | None] = mapped_column(Text)
+    duration_ms: Mapped[int]
+    error: Mapped[str | None] = mapped_column(Text)
+    attempted_at: Mapped[datetime] = _now()

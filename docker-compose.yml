@@ -3,6 +3,9 @@ x-app-env: &app-env
   # Dev-only key. In any real deployment this comes from a secret store.
   # Comma-separate several keys to rotate: the first encrypts, all can decrypt.
   SECRET_ENCRYPTION_KEY: 53e3t6jx9F6UErqnZ3HYdnEJjPMKZ2wiQ-Wwmt1nBQM=
+  # Dev-only: lets the SSRF guard allow the demo receiver, which has a private IP.
+  # Never set this in production.
+  SSRF_ALLOW_HOSTS: receiver
 
 services:
   postgres:
@@ -33,3 +36,19 @@ services:
     depends_on:
       migrate:
         condition: service_completed_successfully
+
+  worker:
+    build: .
+    environment: *app-env
+    command: python -m webhooks.worker
+    restart: unless-stopped
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  # Demo destination: register http://receiver/hook as an endpoint and watch its logs.
+  # Make it fail to see retries:  RECEIVER_STATUS=500 docker compose up -d receiver
+  # Check signatures:  RECEIVER_SECRET=whsec_... docker compose up -d receiver
+  receiver:
+    build: .
+    command: python -m webhooks.receiver --status ${RECEIVER_STATUS:-200} --secret "${RECEIVER_SECRET:-}"

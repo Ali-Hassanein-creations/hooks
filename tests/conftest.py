@@ -1,7 +1,9 @@
+import ipaddress
 import os
+import socket
 import subprocess
 import sys
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 
 import pytest
 from cryptography.fernet import Fernet
@@ -10,25 +12,53 @@ from testcontainers.community.postgres import PostgresContainer
 
 Headers = dict[str, str]
 
+# Real Postgres, not SQLite: advisory locks, arrays and SKIP LOCKED don't exist there.
+# Started in pytest_sessionstart, i.e. before test modules are imported, because
+# webhooks.db reads DATABASE_URL at import time.
+_postgres = PostgresContainer("postgres:16-alpine", driver="asyncpg")
 
-@pytest.fixture(scope="session", autouse=True)
-def database() -> Iterator[None]:
-    # Real Postgres, not SQLite: advisory locks, arrays and SKIP LOCKED don't exist there.
-    with PostgresContainer("postgres:16-alpine", driver="asyncpg") as pg:
-        os.environ["DATABASE_URL"] = pg.get_connection_url()
-        os.environ["SECRET_ENCRYPTION_KEY"] = Fernet.generate_key().decode()
-        subprocess.run([sys.executable, "-m", "alembic", "upgrade", "head"], check=True)
-        yield
+
+def pytest_sessionstart(session: pytest.Session) -> None:
+    _postgres.start()
+    os.environ["DATABASE_URL"] = _postgres.get_connection_url()
+    os.environ["SECRET_ENCRYPTION_KEY"] = Fernet.generate_key().decode()
+    subprocess.run([sys.executable, "-m", "alembic", "upgrade", "head"], check=True)
+
+
+def pytest_sessionfinish(session: pytest.Session) -> None:
+    _postgres.stop()
 
 
 @pytest.fixture(autouse=True)
-async def clean(database: None) -> None:
+async def clean() -> None:
     from sqlalchemy import text
 
     from webhooks.db import engine
 
     async with engine.begin() as conn:
-        await conn.execute(text("TRUNCATE tenants, api_keys, endpoints, events, deliveries"))
+        # Every table references tenants, so CASCADE empties them all.
+        await conn.execute(text("TRUNCATE tenants CASCADE"))
+
+
+@pytest.fixture(autouse=True)
+def dns(monkeypatch: pytest.MonkeyPatch) -> dict[str, list[str]]:
+    """Fake DNS for the SSRF guard, so no test touches the network. Tests can edit the
+    returned table to simulate records changing (e.g. DNS rebinding)."""
+    from webhooks import ssrf
+
+    table = {"example.com": ["93.184.216.34"], "localhost": ["127.0.0.1"]}
+
+    async def fake_getaddrinfo(host: str, port: int) -> list[str]:
+        try:
+            return [str(ipaddress.ip_address(host))]  # literal IPs need no lookup
+        except ValueError:
+            pass
+        if host not in table:
+            raise socket.gaierror(socket.EAI_NONAME, "unknown host")
+        return table[host]
+
+    monkeypatch.setattr(ssrf, "_getaddrinfo", fake_getaddrinfo)
+    return table
 
 
 @pytest.fixture

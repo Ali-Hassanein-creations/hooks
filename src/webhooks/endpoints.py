@@ -1,17 +1,17 @@
 import base64
 import secrets
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Annotated, Literal
-from urllib.parse import urlsplit
 
 from fastapi import APIRouter, HTTPException, Query, Response
 from pydantic import AfterValidator, BaseModel, ConfigDict, Field
-from sqlalchemy import func, select, tuple_
+from sqlalchemy import func, select, tuple_, update
 
+from webhooks import ssrf
 from webhooks.auth import DbSession, TenantId
 from webhooks.db import encrypt
-from webhooks.models import Endpoint
+from webhooks.models import Delivery, Endpoint
 
 router = APIRouter(prefix="/v1/endpoints", tags=["endpoints"])
 
@@ -19,13 +19,21 @@ EventTypes = list[str]
 
 
 def check_url(url: str) -> str:
-    # ponytail: scheme/port only; the week-4 SSRF guard (resolve + IP blocklist) plugs in here
-    parts = urlsplit(url)
-    if parts.scheme not in ("http", "https") or not parts.hostname:
-        raise ValueError("url must be http(s) with a host")
-    if parts.port not in (None, 80, 443):
-        raise ValueError("only ports 80 and 443 are allowed")
+    ssrf.check_static(url)
     return url
+
+
+async def check_destination(url: str) -> None:
+    """Resolve now so a tenant learns at registration that a URL will never be delivered to.
+    The worker re-checks before every attempt, because DNS can change in between."""
+    try:
+        await ssrf.resolve(url)
+    except (ssrf.BlockedURL, ssrf.UnresolvableHost) as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+def _new_secret() -> str:
+    return f"whsec_{secrets.token_urlsafe(32)}"
 
 
 Url = Annotated[str, Field(max_length=2048), AfterValidator(check_url)]
@@ -56,6 +64,16 @@ class EndpointOut(BaseModel):
 
 class EndpointCreated(EndpointOut):
     secret: str
+
+
+class RotateIn(BaseModel):
+    # How long the old secret keeps signing, so receivers can switch over without a gap.
+    overlap_hours: int = Field(default=24, ge=0, le=168)
+
+
+class SecretRotated(BaseModel):
+    secret: str
+    previous_secret_expires_at: datetime
 
 
 class EndpointPage(BaseModel):
@@ -90,7 +108,8 @@ async def _get(session: DbSession, tenant: uuid.UUID, id: uuid.UUID) -> Endpoint
 async def create_endpoint(
     body: EndpointIn, tenant: TenantId, session: DbSession
 ) -> EndpointCreated:
-    secret = f"whsec_{secrets.token_urlsafe(32)}"
+    await check_destination(body.url)
+    secret = _new_secret()
     ep = Endpoint(tenant_id=tenant, secret_encrypted=encrypt(secret), **body.model_dump())
     session.add(ep)
     await session.commit()
@@ -129,6 +148,8 @@ async def update_endpoint(
     id: uuid.UUID, body: EndpointPatch, tenant: TenantId, session: DbSession
 ) -> EndpointOut:
     ep = await _get(session, tenant, id)
+    if body.url is not None:
+        await check_destination(body.url)
     changes = body.model_dump(exclude_unset=True)
     for field, value in changes.items():
         setattr(ep, field, value)
@@ -143,5 +164,29 @@ async def update_endpoint(
 async def delete_endpoint(id: uuid.UUID, tenant: TenantId, session: DbSession) -> Response:
     ep = await _get(session, tenant, id)
     ep.deleted_at = func.now()
+    # Nothing will ever deliver these now; dead-letter them so they stay visible and
+    # replayable instead of sitting in the queue forever.
+    await session.execute(
+        update(Delivery)
+        .where(Delivery.endpoint_id == ep.id, Delivery.status == "pending")
+        .values(status="dead_lettered")
+    )
     await session.commit()
     return Response(status_code=204)
+
+
+@router.post("/{id}/rotate-secret")
+async def rotate_secret(
+    id: uuid.UUID, tenant: TenantId, session: DbSession, body: RotateIn | None = None
+) -> SecretRotated:
+    """Issue a new signing secret. Until the overlap ends, deliveries carry a signature for
+    both the new and the old secret, so receivers can move over at their own pace."""
+    ep = await _get(session, tenant, id)
+    secret = _new_secret()
+    ep.previous_secret_encrypted = ep.secret_encrypted
+    ep.previous_secret_expires_at = func.now() + timedelta(hours=(body or RotateIn()).overlap_hours)
+    ep.secret_encrypted = encrypt(secret)
+    await session.commit()
+    await session.refresh(ep)
+    assert ep.previous_secret_expires_at is not None
+    return SecretRotated(secret=secret, previous_secret_expires_at=ep.previous_secret_expires_at)
