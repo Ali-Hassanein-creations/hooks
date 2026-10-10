@@ -1,4 +1,6 @@
+import ipaddress
 import os
+import socket
 import subprocess
 import sys
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -36,6 +38,27 @@ async def clean() -> None:
     async with engine.begin() as conn:
         # Every table references tenants, so CASCADE empties them all.
         await conn.execute(text("TRUNCATE tenants CASCADE"))
+
+
+@pytest.fixture(autouse=True)
+def dns(monkeypatch: pytest.MonkeyPatch) -> dict[str, list[str]]:
+    """Fake DNS for the SSRF guard, so no test touches the network. Tests can edit the
+    returned table to simulate records changing (e.g. DNS rebinding)."""
+    from webhooks import ssrf
+
+    table = {"example.com": ["93.184.216.34"], "localhost": ["127.0.0.1"]}
+
+    async def fake_getaddrinfo(host: str, port: int) -> list[str]:
+        try:
+            return [str(ipaddress.ip_address(host))]  # literal IPs need no lookup
+        except ValueError:
+            pass
+        if host not in table:
+            raise socket.gaierror(socket.EAI_NONAME, "unknown host")
+        return table[host]
+
+    monkeypatch.setattr(ssrf, "_getaddrinfo", fake_getaddrinfo)
+    return table
 
 
 @pytest.fixture

@@ -19,8 +19,10 @@ from typing import Any
 import httpx
 from sqlalchemy import func, text, update
 
-from webhooks.db import Session
+from webhooks import ssrf
+from webhooks.db import Session, decrypt
 from webhooks.models import Delivery, DeliveryAttempt
+from webhooks.verify import sign
 
 log = logging.getLogger("webhooks.worker")
 
@@ -51,7 +53,9 @@ SET next_attempt_at = now() + make_interval(secs => :lease),
     attempt_count = d.attempt_count + 1
 FROM due, events ev, endpoints e
 WHERE d.id = due.id AND ev.id = d.event_id AND e.id = d.endpoint_id
-RETURNING d.id, d.tenant_id, d.attempt_count, ev.event_type, ev.payload, e.url
+RETURNING d.id, d.tenant_id, d.attempt_count, ev.event_type, ev.payload, e.url,
+          e.secret_encrypted, e.previous_secret_encrypted,
+          e.previous_secret_expires_at > now() AS previous_active
 """)
 
 
@@ -63,6 +67,7 @@ class Claimed:
     event_type: str
     payload: Any
     url: str
+    secrets: tuple[str, ...]  # current secret, plus the previous one during a rotation
 
 
 @dataclass(frozen=True)
@@ -72,6 +77,7 @@ class Result:
     body: str | None
     duration_ms: int
     error: str | None
+    blocked: bool = False  # SSRF guard refused the destination: never worth retrying
 
     @property
     def ok(self) -> bool:
@@ -95,25 +101,45 @@ async def claim(batch: int) -> list[Claimed]:
             r.event_type,
             json.loads(r.payload) if isinstance(r.payload, str) else r.payload,
             r.url,
+            (decrypt(r.secret_encrypted),)
+            + ((decrypt(r.previous_secret_encrypted),) if r.previous_active else ()),
         )
         for r in rows
     ]
 
 
 async def send(client: httpx.AsyncClient, c: Claimed) -> Result:
+    # Serialised once: these exact bytes are both signed and sent.
     body = json.dumps(c.payload, separators=(",", ":")).encode()
+    timestamp = str(int(time.time()))
     headers = {
         "Content-Type": "application/json",
         "User-Agent": "webhooks/0.1",
         # Identical on every retry: this is what receivers deduplicate on.
         "X-Webhook-Id": str(c.id),
         "X-Webhook-Event": c.event_type,
+        "X-Webhook-Timestamp": timestamp,
+        "X-Webhook-Signature": ",".join(f"v1={sign(s, timestamp, body)}" for s in c.secrets),
     }
     status, resp_body, error = None, None, None
     start = time.perf_counter()
     try:
+        # Re-checked on every attempt, and the connection goes to the IP we just validated,
+        # so DNS that changed since registration (rebinding) can't redirect us inward.
+        target = await ssrf.resolve(c.url)
+    except ssrf.BlockedURL as exc:
+        return Result(headers, None, None, 0, f"blocked: {exc}", blocked=True)
+    except ssrf.UnresolvableHost as exc:
+        return Result(headers, None, None, 0, str(exc))
+    try:
         async with asyncio.timeout(TOTAL_TIMEOUT):
-            async with client.stream("POST", c.url, content=body, headers=headers) as resp:
+            async with client.stream(
+                "POST",
+                target.url,
+                content=body,
+                headers={**headers, "Host": target.host},
+                extensions={"sni_hostname": target.sni} if target.sni else {},
+            ) as resp:
                 status = resp.status_code
                 # Read at most MAX_STORED_BODY bytes: a 50 MB error page is never downloaded.
                 chunks = bytearray()
@@ -146,7 +172,7 @@ async def record(c: Claimed, r: Result) -> None:
         )
         if r.ok:
             values: dict[str, Any] = {"status": "succeeded"}
-        elif c.attempt >= MAX_ATTEMPTS:
+        elif r.blocked or c.attempt >= MAX_ATTEMPTS:
             values = {"status": "dead_lettered"}
         else:
             values = {"next_attempt_at": func.now() + timedelta(seconds=retry_delay(c.attempt))}
