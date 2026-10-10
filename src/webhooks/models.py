@@ -62,6 +62,9 @@ class Endpoint(Base):
     url: Mapped[str] = mapped_column(Text)
     description: Mapped[str | None] = mapped_column(Text)
     secret_encrypted: Mapped[bytes] = mapped_column(LargeBinary)
+    # During a rotation the old secret keeps signing too, until it expires.
+    previous_secret_encrypted: Mapped[bytes | None] = mapped_column(LargeBinary)
+    previous_secret_expires_at: Mapped[datetime | None]
     event_types: Mapped[list[str]] = mapped_column(ARRAY(Text))
     status: Mapped[str] = mapped_column(String(16), server_default="enabled")
     created_at: Mapped[datetime] = _now()
