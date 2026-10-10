@@ -7,11 +7,11 @@ from urllib.parse import urlsplit
 
 from fastapi import APIRouter, HTTPException, Query, Response
 from pydantic import AfterValidator, BaseModel, ConfigDict, Field
-from sqlalchemy import func, select, tuple_
+from sqlalchemy import func, select, tuple_, update
 
 from webhooks.auth import DbSession, TenantId
 from webhooks.db import encrypt
-from webhooks.models import Endpoint
+from webhooks.models import Delivery, Endpoint
 
 router = APIRouter(prefix="/v1/endpoints", tags=["endpoints"])
 
@@ -143,5 +143,12 @@ async def update_endpoint(
 async def delete_endpoint(id: uuid.UUID, tenant: TenantId, session: DbSession) -> Response:
     ep = await _get(session, tenant, id)
     ep.deleted_at = func.now()
+    # Nothing will ever deliver these now; dead-letter them so they stay visible and
+    # replayable instead of sitting in the queue forever.
+    await session.execute(
+        update(Delivery)
+        .where(Delivery.endpoint_id == ep.id, Delivery.status == "pending")
+        .values(status="dead_lettered")
+    )
     await session.commit()
     return Response(status_code=204)

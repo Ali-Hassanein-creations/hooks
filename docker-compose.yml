@@ -33,3 +33,18 @@ services:
     depends_on:
       migrate:
         condition: service_completed_successfully
+
+  worker:
+    build: .
+    environment: *app-env
+    command: python -m webhooks.worker
+    restart: unless-stopped
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  # Demo destination: register http://receiver/hook as an endpoint and watch its logs.
+  # Make it fail to see retries:  RECEIVER_STATUS=500 docker compose up -d receiver
+  receiver:
+    build: .
+    command: python -m webhooks.receiver --status ${RECEIVER_STATUS:-200}
