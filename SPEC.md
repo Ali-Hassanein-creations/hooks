@@ -20,11 +20,11 @@ Success means a portfolio-grade system whose hard parts are built and proven by 
 |---|---|---|---|
 | `ingest` | tenants, API keys, endpoints CRUD, idempotent `POST /v1/events` with transactional fan-out | none | **done** (see README) |
 | `delivery-worker` | claim due deliveries, POST them, record attempts, retry with jittered backoff, dead-letter | ingest | **done**, see [SPEC-delivery-worker.md](SPEC-delivery-worker.md) |
-| `security` | HMAC signing with timestamp, SSRF guard including DNS-rebinding pinning, secret rotation overlap, per-tenant ingest rate limit | delivery-worker | **next** |
+| `security` | HMAC signing with timestamp, SSRF guard including DNS-rebinding pinning, secret rotation overlap, per-tenant ingest rate limit | delivery-worker | **done**, see [SPEC-security.md](SPEC-security.md) |
 | `operations` | circuit breaker, `/v1/deliveries` API and replay, Prometheus `/metrics`, JSON logs with request_id, public deploy | delivery-worker | **next** |
 | `dashboard` | one page of endpoint health and a live delivery log (optional; cut first) | operations | planned |
 
-Build order: ingest → delivery-worker → security → operations → dashboard.
+Build order: ingest → delivery-worker → security → operations → dashboard. ingest, delivery-worker and security are done; operations is next.
 
 security and operations both depend only on delivery-worker. security goes first because it is what sets the project apart.
 
@@ -43,7 +43,8 @@ Install:    python -m venv .venv && .venv/Scripts/pip install -e ".[dev]"
 Lint:       ruff check . && ruff format --check .
 Types:      mypy --strict src
 Test:       pytest -q                       # Docker must be running (testcontainers)
-Run:        docker compose up -d --build
+Run:        docker compose up -d --build     # postgres, migrate, api, worker, receiver
+Worker:     python -m webhooks.worker         # needs DATABASE_URL, SECRET_ENCRYPTION_KEY
 Tenant:     docker compose exec api python -m webhooks.cli create-tenant NAME
 Migrate:    alembic upgrade head            # needs DATABASE_URL
 New mig:    alembic revision -m "..."        # hand-written; env.py has no autogenerate metadata

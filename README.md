@@ -2,7 +2,7 @@
 
 A multi-tenant webhook delivery service with at-least-once guarantees, signed payloads, and automatic retries.
 
-> **Status:** weeks 1–3 of the build. Ingest, idempotency, the transactional fan-out and the delivery worker (retries, backoff, dead-letter) are done. Signing and SSRF defence come next.
+> **Status:** weeks 1–4 of the build. Ingest, the delivery worker (retries, backoff, dead-letter), SSRF defence, signed payloads, secret rotation and rate limiting are done. Next: operations (circuit breaker, delivery API and replay, metrics).
 
 ## The guarantee
 
@@ -35,6 +35,9 @@ docker compose logs receiver worker
 # 4. Watch retries: make the receiver fail, send another event, and see it back off
 RECEIVER_STATUS=500 docker compose up -d receiver
 docker compose logs -f worker
+
+# 5. Check signatures the way a real receiver would: give the receiver the endpoint's secret
+RECEIVER_SECRET=whsec_... docker compose up -d receiver   # its log then shows signature=valid
 ```
 
 OpenAPI docs are at `localhost:8000/docs`.
@@ -56,7 +59,7 @@ OpenAPI docs are at `localhost:8000/docs`.
 **Trade-off:** ingest latency grows with the number of matching endpoints per tenant. A tenant with thousands of endpoints subscribed to one event type would need the fan-out moved to an async step, still in the outbox.
 
 ### Idempotent ingest
-`UNIQUE (tenant_id, idempotency_key)` means a duplicate can never be stored. The constraint alone would turn two concurrent retries into a 500, though. So the handler takes `pg_advisory_xact_lock` on the tenant and key first. A retry that arrives while the original request is still in flight waits for it, then returns the original event with **200**; a new event gets **202**. `tests/test_events.py::test_concurrent_duplicates_create_one_event` fires 20 concurrent identical requests and asserts exactly one event and one set of deliveries. That test fails if the lock is removed.
+`UNIQUE (tenant_id, idempotency_key)` means a duplicate can never be stored. The constraint alone would turn two concurrent retries into a 500, though. So the handler takes `pg_advisory_xact_lock` on the tenant and key first. A retry that arrives while the original request is still in flight waits for it, then returns the original event with **200**; a new event gets **202**. Reusing a key with a *different* body returns **422**: a SHA-256 of the canonical request body is stored with the event and compared. `tests/test_events.py::test_concurrent_duplicates_create_one_event` fires 20 concurrent identical requests and asserts exactly one event and one set of deliveries. That test fails if the lock is removed.
 
 ### Claiming work
 **Problem:** several workers poll the same table; each due delivery must be attempted by exactly one of them, and a worker that crashes mid-request must not lose the delivery.
@@ -71,11 +74,45 @@ OpenAPI docs are at `localhost:8000/docs`.
 - Timeouts: 3s to connect, 10s to read, 15s total. At most 4 KB of a response is read and stored, so a 50 MB error page is never downloaded.
 - Deleting an endpoint dead-letters its waiting deliveries; disabling one pauses them until it is re-enabled.
 
-## Security (so far)
+## Security
+
+### SSRF defence
+Tenants choose the URLs we send requests to. Without a guard, a tenant could register `http://169.254.169.254/latest/meta-data/` and have us fetch cloud credentials for them, or probe our private network. [`ssrf.py`](src/webhooks/ssrf.py):
+- Allows only http(s) on ports 80 and 443, and rejects `user:pass@` in URLs.
+- Resolves the hostname itself and requires **every** returned address to be public. That excludes loopback in any notation, `0.0.0.0`, link-local (`169.254.0.0/16`, `fe80::/10`), the private ranges, CGNAT, IPv6 unique-local, and IPv4-mapped IPv6 such as `::ffff:127.0.0.1`.
+- **Defends against DNS rebinding.** A hostname can resolve to a public IP at registration and to `169.254.169.254` a minute later. The guard runs again before *every* attempt, and the worker connects to the exact IP it just validated, sending the original `Host` header and TLS SNI. So the certificate is still checked for the hostname, and there is no second DNS lookup to race.
+- Never follows redirects, and dead-letters blocked destinations at once instead of retrying them.
+
+[`tests/test_ssrf.py`](tests/test_ssrf.py) has 22 blocked-target cases, plus tests for rebinding, pinning, and disguised loopback through the real OS resolver.
+
+### Signed payloads and replay protection
+Every delivery carries:
+```
+X-Webhook-Id:        <delivery id>        # the same on every retry: deduplicate on it
+X-Webhook-Timestamp: 1760112000
+X-Webhook-Signature: v1=<hex HMAC-SHA256(secret, "{timestamp}.{raw body}")>
+```
+- The body is serialised once, and those exact bytes are signed and sent. Receivers must verify the **raw** bytes; re-serialised JSON won't match.
+- The timestamp is inside the signed content, and receivers reject anything more than 5 minutes off, so a captured request can't be replayed later.
+- [`verify.py`](src/webhooks/verify.py) is a standard-library-only helper receivers can copy. It compares with `hmac.compare_digest`, which takes constant time.
+
+```python
+from webhooks.verify import verify  # or copy the file
+
+ok = verify(secret, raw_body, headers["X-Webhook-Timestamp"], headers["X-Webhook-Signature"])
+```
+
+### Secret storage and rotation
+- Signing secrets are encrypted at rest with Fernet and shown only once.
+- `SECRET_ENCRYPTION_KEY` accepts comma-separated keys, so the encryption key itself can be rotated.
+- `POST /v1/endpoints/{id}/rotate-secret` (optional `{"overlap_hours": 0-168}`, default 24) issues a new secret. Until the overlap ends, deliveries carry **two** `v1=` signatures, one per secret, so receivers can switch over without a moment of failed verification. See `tests/test_signing.py`.
+
+### Rate limiting
+Ingest is limited per tenant to `RATE_LIMIT_PER_MINUTE` (default 600) events per minute; over that it returns **429** with `Retry-After`. The counter is one row per tenant, updated with an atomic upsert in Postgres. That holds across any number of API replicas without adding Redis. Trade-off: a fixed window allows a burst of up to 2× across a minute boundary.
+
+### API keys and tenant isolation
 - **API keys** use the format `whk_<prefix>_<random>`. Only a SHA-256 hash is stored, looked up by prefix and compared with `hmac.compare_digest`. The keys are 256-bit random values, so a slow KDF would add latency without adding security.
 - **Tenant isolation:** every table carries `tenant_id` and every query filters on it. A resource that belongs to another tenant returns 404, not 403, so ids don't leak. See `tests/test_endpoints.py::test_tenant_isolation`.
-- **Signing secrets** are encrypted at rest with Fernet and returned only once, on creation.
-- **Endpoint URLs** are limited to http(s) on ports 80 and 443. The full SSRF guard (resolve, block private and link-local ranges, pin the IP against DNS rebinding) lands in week 4.
 
 ## Development
 
