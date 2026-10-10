@@ -1,5 +1,7 @@
 # Spec: delivery-worker
 
+**Status: done (2026-10-10).** Code: `src/webhooks/worker.py`. Tests: `tests/test_worker.py`.
+
 ## Objective
 Turn `pending` rows in `deliveries` into HTTP POSTs to the tenant's endpoint:
 - record every attempt
@@ -30,18 +32,7 @@ With concurrent workers, each due delivery is attempted by exactly one worker at
   1. Claim a batch.
   2. Deliver the batch concurrently, capped by `WORKER_CONCURRENCY` (default 10).
   3. Sleep 1s if the batch was empty.
-- **Claim:** one short transaction.
-  ```sql
-  UPDATE deliveries d
-  SET next_attempt_at = now() + interval '60 seconds', attempt_count = d.attempt_count + 1
-  FROM (SELECT d2.id FROM deliveries d2 JOIN endpoints e ON e.id = d2.endpoint_id
-        WHERE d2.status = 'pending' AND d2.next_attempt_at <= now()
-          AND e.status = 'enabled' AND e.deleted_at IS NULL
-        ORDER BY d2.next_attempt_at LIMIT :batch
-        FOR UPDATE OF d2 SKIP LOCKED) due
-  WHERE d.id = due.id
-  RETURNING d.id, d.attempt_count, ...
-  ```
+- **Claim:** one short transaction, `worker.CLAIM`. A CTE selects due rows with `FOR UPDATE OF d SKIP LOCKED`; the `UPDATE` pushes `next_attempt_at` forward by the 60s lease, increments `attempt_count`, and returns everything the send needs (event type and payload, endpoint URL).
 - **Deliver:** outside any transaction.
 - **Record:** one transaction.
   - Insert a `delivery_attempts` row.
@@ -50,30 +41,30 @@ With concurrent workers, each due delivery is attempted by exactly one worker at
     - on 2xx: `succeeded`
     - after the 7th attempt fails: `dead_lettered`
     - otherwise: `pending` with `next_attempt_at = now() + delay`
-- **Migration 0003:**
+- **Migration 0004** (0003 went to `events.request_hash`):
   - Create `delivery_attempts` with these columns: id, tenant_id, delivery_id, attempt_number, request_headers jsonb, response_status, response_body (≤4 KB), duration_ms, error, attempted_at. It has `UNIQUE(delivery_id, attempt_number)`.
   - Drop `deliveries.locked_until`.
   - Narrow the status CHECK to `pending | succeeded | dead_lettered`.
-- **Demo receiver:** `scripts/receiver.py` uses only the standard library. It logs headers and body and replies with a status set by the `--status` flag. It runs as compose service `receiver` on port 80, so an endpoint of `http://receiver/hook` passes the port check. Week 4's SSRF guard will need a dev allowlist for it.
+- **Demo receiver:** `python -m webhooks.receiver` uses only the standard library. It logs each delivery and replies with the status set by `--status`, which compose sets from `RECEIVER_STATUS` (default 200). It runs as compose service `receiver` on port 80, so `http://receiver/hook` passes the port check. The week-4 SSRF guard allowlists it in compose only.
 
 ## Success criteria
 Integration tests over real Postgres, with outbound HTTP via `httpx.MockTransport`:
-- [ ] 200 → `succeeded`, with one attempt row holding status, duration and the sent headers
-- [ ] 500 → `pending`, `attempt_count = 1`, and `next_attempt_at` within [now, now+10s]
-- [ ] a timeout gives an attempt row with `error` set and the delivery still `pending`
-- [ ] 302 counts as a failure, and exactly one request was made (not followed)
-- [ ] a 7th consecutive failure → `dead_lettered`
-- [ ] a 1 MB response body is stored as ≤ 4096 bytes
-- [ ] `X-Webhook-Id` is identical across retries of one delivery
-- [ ] **10 concurrent claim-and-deliver runs against 1 due delivery produce exactly 1 request and 1 attempt row.** The test must fail without `SKIP LOCKED` or the fencing check.
-- [ ] a lapsed lease is re-claimed with `attempt_count = 2`, and the stale worker's late record changes nothing
-- [ ] a disabled endpoint's delivery is not claimed; deleting an endpoint dead-letters its pending deliveries
-- [ ] a unit test on the delay function checks the bounds for every attempt
-- [ ] ruff, `mypy --strict` and CI are green
-- [ ] Manual: `docker compose up`, then send an event:
+- [x] 200 → `succeeded`, with one attempt row holding status, duration and the sent headers
+- [x] 500 → `pending`, `attempt_count = 1`, and `next_attempt_at` within [now, now+10s]
+- [x] a timeout gives an attempt row with `error` set and the delivery still `pending`
+- [x] 302 counts as a failure, and exactly one request was made (not followed)
+- [x] a 7th consecutive failure → `dead_lettered`
+- [x] a 1 MB response body is stored as ≤ 4096 bytes
+- [x] `X-Webhook-Id` is identical across retries of one delivery
+- [x] **10 concurrent claim-and-deliver runs against 1 due delivery produce exactly 1 request and 1 attempt row.** The test must fail without `SKIP LOCKED` or the fencing check.
+- [x] a lapsed lease is re-claimed with `attempt_count = 2`, and the stale worker's late record changes nothing
+- [x] a disabled endpoint's delivery is not claimed; deleting an endpoint dead-letters its pending deliveries
+- [x] a unit test on the delay function checks the bounds for every attempt
+- [x] ruff, `mypy --strict` and CI are green
+- [x] Manual: `docker compose up`, then send an event:
   - it lands on `receiver`
-  - restart the receiver with `--status 500` and the attempts show the backoff
-- [ ] The README gains "Claiming work" and "Retry, backoff and jitter" sections, and the engineering log is updated.
+  - restart it with `RECEIVER_STATUS=500 docker compose up -d receiver` and the attempts show the backoff
+- [x] The README gains "Claiming work" and "Retry, backoff and jitter" sections, and the engineering log is updated.
 
 ## Open questions
 None. Items 1, 2 and 5 were decided on 2026-09-25: lease via `next_attempt_at`, full jitter, disabled endpoints wait and deleted endpoints dead-letter.

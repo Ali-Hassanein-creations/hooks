@@ -19,9 +19,9 @@ Success means a portfolio-grade system whose hard parts are built and proven by 
 | Module id | Responsibility | Depends on | Status |
 |---|---|---|---|
 | `ingest` | tenants, API keys, endpoints CRUD, idempotent `POST /v1/events` with transactional fan-out | none | **done** (see README) |
-| `delivery-worker` | claim due deliveries, POST them, record attempts, retry with jittered backoff, dead-letter | ingest | **next**, see [SPEC-delivery-worker.md](SPEC-delivery-worker.md) |
-| `security` | HMAC signing with timestamp, SSRF guard including DNS-rebinding pinning, secret rotation overlap, per-tenant ingest rate limit | delivery-worker | planned |
-| `operations` | circuit breaker, `/v1/deliveries` API and replay, Prometheus `/metrics`, JSON logs with request_id, public deploy | delivery-worker | planned |
+| `delivery-worker` | claim due deliveries, POST them, record attempts, retry with jittered backoff, dead-letter | ingest | **done**, see [SPEC-delivery-worker.md](SPEC-delivery-worker.md) |
+| `security` | HMAC signing with timestamp, SSRF guard including DNS-rebinding pinning, secret rotation overlap, per-tenant ingest rate limit | delivery-worker | **next** |
+| `operations` | circuit breaker, `/v1/deliveries` API and replay, Prometheus `/metrics`, JSON logs with request_id, public deploy | delivery-worker | **next** |
 | `dashboard` | one page of endpoint health and a live delivery log (optional; cut first) | operations | planned |
 
 Build order: ingest → delivery-worker → security → operations → dashboard.
