@@ -81,9 +81,10 @@ stateDiagram-v2
 
 ## Quickstart
 
-Requirements: Docker. One command starts Postgres, runs the migrations, and starts the API, a worker and a demo receiver.
+Requirements: Docker and Python (only to generate a key). First create a `.env` with a fresh encryption key; it's git-ignored, so the key never reaches the repo. Then one command starts Postgres, runs the migrations, and starts the API, a worker and a demo receiver.
 
 ```bash
+echo "SECRET_ENCRYPTION_KEY=$(python -c 'import base64,os; print(base64.urlsafe_b64encode(os.urandom(32)).decode())')" > .env
 docker compose up -d --build
 docker compose exec api python -m webhooks.cli create-tenant acme   # prints an API key, once
 export KEY=whk_...                                                    # paste it here
@@ -365,12 +366,12 @@ In compose, migrations run in a one-shot `migrate` service before the API and wo
 | `SSRF_ALLOW_HOSTS` | no | empty | api, worker | **Dev only.** Hostnames exempt from the SSRF guard. Compose sets it to `receiver`. |
 | `RECEIVER_STATUS`, `RECEIVER_SECRET` | no | `200`, empty | compose only | Make the demo receiver fail, or verify signatures |
 
-Generate an encryption key:
+Generate an encryption key (32 random bytes, URL-safe base64; standard library only):
 ```bash
-python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+python -c "import base64,os; print(base64.urlsafe_b64encode(os.urandom(32)).decode())"
 ```
 
-The key in `docker-compose.yml` is a published, dev-only value. Never use it outside your machine.
+Compose reads `SECRET_ENCRYPTION_KEY` from `.env`, which is git-ignored, and refuses to start without it. [`.env.example`](.env.example) shows the format. Never commit a real key. Losing the key makes stored endpoint secrets unreadable, so back it up wherever you keep deployment secrets.
 
 ## Project layout
 
