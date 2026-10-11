@@ -31,3 +31,10 @@
 - **`Row.count` is a method.** SQLAlchemy rows are tuples, so `row.count` returns `tuple.count`, not a column named `count`. The comparison would have raised at runtime; mypy caught it first. Renamed the column to `n`.
 - **Rate limit in Postgres, not Redis.** An atomic upsert on one row per tenant does it and adds no new service. The fixed window allows 2× bursts across a minute boundary; good enough for now.
 - **Docker check:** a metadata URL got 422; the receiver verified the signature; after a rotation it still verified with the old secret during the overlap.
+
+## 2026-10-11 — encryption key out of the repo
+
+- **GitGuardian flagged `SECRET_ENCRYPTION_KEY` in `docker-compose.yml`.** It was a dev-only Fernet key that only ever encrypted endpoint secrets in a local demo database, so nothing real was exposed. But a key in a public repo is still a bad habit, and every change to the file re-triggers the alert.
+- **Fix:** compose now reads the key from a git-ignored `.env` and refuses to start without one (`${SECRET_ENCRYPTION_KEY:?…}`). `.env.example` and the README quickstart give a one-line, standard-library command to generate a fresh key.
+- **History:** the old key is still in earlier commits. Rewriting public history isn't worth it for a key that protects nothing; it must simply never be used anywhere.
+- **Gotcha:** a database encrypted with the old key can't decrypt its endpoint secrets with a new one. For the demo that means `docker compose down -v` once; for a real deployment, rotate by listing both keys (new first) until secrets are re-encrypted.
